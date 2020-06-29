@@ -4,7 +4,7 @@ import gym
 
 from replay_buffer import OffpolicyReplayBuffer
 
-def mlp(x, hidden_size, activation=tf.nn.relu, out_activation=None):
+def mlp(x, hidden_size, activation, out_activation=None):
     for hidden in hidden_size[:-1]:
         x = tf.layers.dense(x, hidden, activation=activation)
     return tf.layers.dense(x, hidden_size[-1], activation=out_activation)
@@ -75,10 +75,11 @@ class Agent():
                                 for var, tgt_var in zip(get_vars("main"), get_vars("target"))])
         
         self.sess = tf.Session()
+        self.sess.run(tf.global_variables_initializer())
         self.sess.run(self.target_init_op)
     
     def act(self, obs):
-        pure_a = self.sess.run(self.pi)
+        pure_a = self.sess.run(self.pi, feed_dict={self.obs_ph: obs.reshape(1,-1)})[0]
         return np.clip(pure_a + self.flags.noise_scale * self.act_lim,
                             -self.act_lim, self.act_lim)
     
@@ -86,7 +87,8 @@ class Agent():
         ep_score, ep_step, obs = 0, 0, self.test_env.reset()
         d = False
         while not d and ep_step < self.flags.max_t:
-            obs_, r, d, info = self.test_env.step(self.act(obs))
+            a = self.sess.run(self.pi, feed_dict={self.obs_ph: obs.reshape(1,-1)})[0]
+            obs_, r, d, info = self.test_env.step(a)
             ep_step += 1
             ep_score += r
             obs = obs_
@@ -122,6 +124,7 @@ class Agent():
                     q_loss, pi_loss, _, _ = self.sess.run(
                         [self.q_loss, self.pi_loss, self.train_q_op, self.train_pi_op], 
                         fd)
+                self.sess.run(self.target_update_op)
                 
                 scores, steps = [], []
                 for _ in range(self.flags.update_every):

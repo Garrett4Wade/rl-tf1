@@ -21,6 +21,7 @@ def ddpg_mlp_actor_critic(obs,
         pi = act_lim * mlp(obs, list(hidden_size)+[act_dim], activation, out_activation)
     with tf.variable_scope('q'):
         q = tf.squeeze(mlp(tf.concat([obs, a], -1), list(hidden_size)+[1], activation), -1)
+    with tf.variable_scope('q', reuse=tf.AUTO_REUSE):
         q_pi = tf.squeeze(mlp(tf.concat([obs, pi], -1), list(hidden_size)+[1], activation), -1)
     return pi, q, q_pi
 
@@ -95,6 +96,7 @@ class Agent():
         return ep_score, ep_step
     
     def train(self):
+        print([x.name for x in get_vars('main/q')])
         ep_score, ep_step, d, obs = 0, 0, False, self.env.reset()
         for i in range(self.flags.total_steps):
             global_step = i + 1
@@ -124,7 +126,7 @@ class Agent():
                     q_loss, pi_loss, _, _ = self.sess.run(
                         [self.q_loss, self.pi_loss, self.train_q_op, self.train_pi_op], 
                         fd)
-                self.sess.run(self.target_update_op)
+                    self.sess.run(self.target_update_op)
                 
                 scores, steps = [], []
                 for _ in range(self.flags.update_every):
@@ -142,7 +144,7 @@ if __name__ == "__main__":
     flags.DEFINE_integer('total_steps', int(1e6), 'total steps')
     flags.DEFINE_integer('buf_size', int(1e6), "replay buffer size")
 
-    flags.DEFINE_integer('batch_size', 64, 'batch size')
+    flags.DEFINE_integer('batch_size', 128, 'batch size')
     flags.DEFINE_float('pi_lr', 1e-3, 'learning rate for policy')
     flags.DEFINE_float('q_lr', 1e-3, 'learning rate for q function')
 
@@ -151,9 +153,9 @@ if __name__ == "__main__":
     flags.DEFINE_float("rho", 0.995, 'smooth factor')
     
     flags.DEFINE_integer('update_after', 1000, 'update after')
-    flags.DEFINE_integer('update_every', 10, 'update every')
+    flags.DEFINE_integer('update_every', 50, 'update every')
     
-    flags.DEFINE_integer("max_t", 200, 'maximum length of 1 episode')
+    flags.DEFINE_integer("max_t", 1000, 'maximum length of 1 episode')
     flags.DEFINE_float('noise_scale', 0.01, 'noise scale')
 
     env_fn = lambda: gym.make(FLAGS.env_name)

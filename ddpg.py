@@ -78,10 +78,11 @@ class Agent():
         self.sess = tf.Session()
         self.sess.run(tf.global_variables_initializer())
         self.sess.run(self.target_init_op)
+        print(tf.global_variables())
     
     def act(self, obs):
         pure_a = self.sess.run(self.pi, feed_dict={self.obs_ph: obs.reshape(1,-1)})[0]
-        return np.clip(pure_a + self.flags.noise_scale * self.act_lim,
+        return np.clip(pure_a + self.flags.noise_scale * self.act_lim * np.random.randn(),
                             -self.act_lim, self.act_lim)
     
     def test_once(self):

@@ -14,13 +14,13 @@ class OffpolicyReplayBuffer():
     def __len__(self):
         return min(self.iter, self.max_size)
     
-    def add(self, obs, act, nex_obs, r, d):
+    def add(self, **kwargs):
         idx = self.iter % self.max_size
-        self.obs[idx] = obs
-        self.act[idx] = act
-        self.nex_obs[idx] = nex_obs
-        self.r[idx] = r
-        self.d[idx] = d
+        self.obs[idx] = kwargs['obs']
+        self.act[idx] = kwargs['act']
+        self.nex_obs[idx] = kwargs['nex_obs']
+        self.r[idx] = kwargs['r']
+        self.d[idx] = kwargs['d']
         self.iter += 1
     
     def get(self, batch_size):

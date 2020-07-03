@@ -106,7 +106,8 @@ class Agent():
             ep_score += r
             ep_step += 1
 
-            self.buffer.add(obs, a, obs_, r, d)
+            seg = dict(obs=obs, act=a, nex_obs=obs_, r=r, d=d)
+            self.buffer.add(seg)
 
             obs = obs_
 

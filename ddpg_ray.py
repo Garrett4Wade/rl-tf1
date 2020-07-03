@@ -77,6 +77,9 @@ class Model:
     def __init__(self, obs_dim, act_dim, act_lim, is_training):
         self.set_ws_ops = None
         self.ws_dphs = None
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.act_lim = act_lim
         self.obs, self.act, self.nex_obs, self.r, self.d = \
             tf.placeholder(dtype=tf.float32, shape=(None, obs_dim), name='obs'), \
             tf.placeholder(dtype=tf.float32, shape=(None, act_dim), name='act'), \
@@ -170,7 +173,6 @@ def build_training_model(kwargs):
                  act_lim=kwargs['act_lim'],
                  is_training=True)
 
-@ray.remote
 class Worker():
     def __init__(self, worker_id, model_fn, env_fn, ps, kwargs):
         self.id = worker_id
@@ -196,8 +198,8 @@ class Worker():
             self.saver.restore(self.sess, ckpt_s.model_checkpoint_path)
         else:
             self.sess.run(tf.global_variables_initializer())
-        print("init worker {} checkpoint hashing".format(self.id))
         self.ckpt_hashing = ray.get(self.ps.get_hashing.remote())
+        print("init worker {} checkpoint hashing".format(self.id))
     
     def _data_generator(self):
         global_step = 0
@@ -209,7 +211,7 @@ class Worker():
                 if ckpt_hashing_ != self.ckpt_hashing:
                     weights = ray.get(self.ps.pull.remote())
                     if weights:
-                        self.model.load_from_weights(weights)
+                        self.model.load_from_weights(self.sess, weights)
                         print("worker {} load weights from parameter server, before:{}, after:{}".format(
                             self.id, self.ckpt_hashing, ckpt_hashing_))
                         self.ckpt_hashing = ckpt_hashing_
@@ -218,7 +220,7 @@ class Worker():
             
             # step in environment
             assert not d and ep_step < self.t_max
-            act = self.sess.run(self.model.pi, {self.model.obs: obs})
+            act = self.sess.run(self.model.pi, {self.model.obs: obs.reshape(1,-1)})[0]
             act += self.noise_scale * self.model.act_lim
             act = np.clip(act, -self.model.act_lim, self.model.act_lim)
 
@@ -226,30 +228,36 @@ class Worker():
             ep_step += 1
             ep_score += 1
             global_step += 1
-            yield dict(obs=obs, act=act, nex_obs=obs_, r=r, d=d)
+            res = dict(obs=obs, act=act, nex_obs=obs_, r=r, d=d)
 
             if d or ep_step >= self.t_max:
                 ep_step, ep_score, d, obs = 0, 0, False, self.env.reset()
+                print("worker {} end episodes, episode step {}, episode score {:.2f}".format(
+                    self.id, ep_step, ep_score
+                ))
+            yield res
     
     def get(self):
         return next(self._data_generator())
 
 class RolloutCollector():
-    def __init__(self, num_workers, ps, **kwargs):
-        self.num_workers = int(num_workers)
+    def __init__(self, ps, **kwargs):
+        self.num_workers = int(kwargs['num_workers'])
         self.ps = ps
         self.workers = [
-            Worker(
+            ray.remote(
+                num_cpus=kwargs['cpu_per_worker']
+            )(Worker).remote(
                 worker_id=i,
                 model_fn=build_model,
                 env_fn=build_env,
                 ps=ps,
                 kwargs=kwargs
-            ).remote(
-                num_cpus=kwargs['cpu_per_worker']
-            ) for i in range(num_workers)
+            ) for i in range(self.num_workers)
         ]
+        print("#############################################")
         print("Workers starting ......")
+        print("#############################################")
 
     def _data_id_generator(self, num_returns=1, timeout=None):
         self.worker_done = [True for _ in range(self.num_workers)]
@@ -285,7 +293,8 @@ class BufferReader(Thread):
 
     def run(self):
         while True:
-            self.global_buffer.add(self.rollout_collector.get_one_sample())
+            sample = self.rollout_collector.get_one_sample()
+            self.global_buffer.add(sample)
 
 class Learner():
     def __init__(self, model_fn, kwargs):
@@ -295,7 +304,7 @@ class Learner():
                                             kwargs['buf_size'])
         # TODO: push into parameter server
         self.ps = AsyncParameterServer.remote()
-        self.rollout_collector = RolloutCollector(kwargs['num_workers'], self.ps, **kwargs)
+        self.rollout_collector = RolloutCollector(self.ps, **kwargs)
 
         self.buffer_reader = BufferReader(global_buffer=self.buffer,
                                           rollout_collector=self.rollout_collector)
@@ -328,17 +337,21 @@ class Learner():
             self.sess.run(tf.global_variables_initializer())
             self.sess.run(self.model.target_init_op)
         
-        ray.get(self.ps.push.remote(self.model.get_weights()))
+        ray.get(self.ps.push.remote(self.model.get_weights(self.sess)))
     
     def train(self):
         for t in range(1, self.kwargs['total_steps']+1):
-            if t % self.kwargs['udpate_every'] == 0 and (
-                t >= self.kwargs['update_after']):
+            if t % self.kwargs['update_every'] == 0 and (
+                t >= self.kwargs['update_after']) and (
+                self.buffer.iter >= kwargs['batch_size']
+                ):
                 for _ in range(self.kwargs['update_every']):
                     batch = self.buffer.get(self.kwargs['batch_size'])
                     self.sess.run([self.train_pi_op,self.train_q_op],
                         feed_dict=batch)
                     self.sess.run(self.target_update_op)
+                
+                ray.get(self.ps.push.remote(self.model.get_weights(self.sess)))
 
 
 flags = tf.flags
@@ -359,7 +372,7 @@ flags.DEFINE_float("rho", 0.995, 'smooth factor')
 flags.DEFINE_integer('update_after', 1000, 'update after')
 flags.DEFINE_integer('update_every', 50, 'update every')
 
-flags.DEFINE_integer("max_t", 1000, 'maximum length of 1 episode')
+flags.DEFINE_integer("t_max", 25, 'maximum length of 1 episode')
 flags.DEFINE_float('noise_scale', 0.01, 'noise scale')
 
 flags.DEFINE_string('ckpt_dir', 'tmp/', 'checkpoint directory')
@@ -376,6 +389,7 @@ kwargs['act_lim'] = init_env.action_space.high[0]
 del init_env
 
 if __name__ == "__main__":
+    ray.init()
     learner = Learner(build_training_model, kwargs)
     learner.train()
 

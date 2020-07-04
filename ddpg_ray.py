@@ -297,7 +297,9 @@ class BufferReader(Thread):
             self.global_buffer.add(sample)
 
 class Learner():
-    def __init__(self, model_fn, kwargs):
+    def __init__(self, model_fn, env_fn, kwargs):
+        self.test_env = env_fn(kwargs)
+
         self.kwargs = kwargs
         self.buffer = OffpolicyReplayBuffer(kwargs['obs_dim'], 
                                             kwargs['act_dim'], 
@@ -339,6 +341,17 @@ class Learner():
         
         ray.get(self.ps.push.remote(self.model.get_weights(self.sess)))
     
+    def test_once(self):
+        ep_score, ep_step, obs = 0, 0, self.test_env.reset()
+        d = False
+        while not d and ep_step < self.kwargs['t_max']:
+            a = self.sess.run(self.model.pi, feed_dict={self.model.obs: obs.reshape(1,-1)})[0]
+            obs_, r, d, info = self.test_env.step(a)
+            ep_step += 1
+            ep_score += r
+            obs = obs_
+        return ep_score, ep_step
+    
     def train(self):
         for t in range(1, self.kwargs['total_steps']+1):
             if t % self.kwargs['update_every'] == 0 and (
@@ -352,6 +365,15 @@ class Learner():
                     self.sess.run(self.target_update_op)
                 
                 ray.get(self.ps.push.remote(self.model.get_weights(self.sess)))
+            
+            scores, steps = [], []
+            for _ in range(self.kwargs['update_every']):
+                ep_score, ep_step = self.test_once()
+                scores.append(ep_score)
+                steps.append(ep_step)
+            print("test timetep [{}/{}], \t test score {:.2f}, \t test steps {:.2f}".format(
+                t, self.kwargs['total_steps'], np.mean(scores), np.mean(steps)
+            ))
 
 
 flags = tf.flags
@@ -372,7 +394,7 @@ flags.DEFINE_float("rho", 0.995, 'smooth factor')
 flags.DEFINE_integer('update_after', 1000, 'update after')
 flags.DEFINE_integer('update_every', 50, 'update every')
 
-flags.DEFINE_integer("t_max", 25, 'maximum length of 1 episode')
+flags.DEFINE_integer("t_max", 200, 'maximum length of 1 episode')
 flags.DEFINE_float('noise_scale', 0.01, 'noise scale')
 
 flags.DEFINE_string('ckpt_dir', 'tmp/', 'checkpoint directory')
@@ -390,7 +412,7 @@ del init_env
 
 if __name__ == "__main__":
     ray.init()
-    learner = Learner(build_training_model, kwargs)
+    learner = Learner(build_training_model, build_env, kwargs)
     learner.train()
 
 

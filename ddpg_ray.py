@@ -4,54 +4,8 @@ import ray
 import time
 from threading import Thread
 from replay_buffer import OffpolicyReplayBuffer
+from utils import get_vars, ray_get_and_free, mlp, AsyncParameterServer
 import re
-
-_LAST_FREE_TIME = 0.0
-_TO_FREE = []
-
-def ray_get_and_free(object_ids):
-    """
-    Call ray.get and then queue the object ids for deletion.
-
-    This function should be used whenever possible in RLlib, to optimize
-    memory usage. The only exception is when an object_id is shared among
-    multiple readers.
-
-    Args:
-        object_ids (ObjectID|List[ObjectID]): Object ids to fetch and free.
-
-    Returns:
-        The result of ray.get(object_ids).
-    """
-
-    free_delay_s = 10.0
-    max_free_queue_size = 100
-
-    global _LAST_FREE_TIME
-    global _TO_FREE
-
-    result = ray.get(object_ids)
-    if type(object_ids) is not list:
-        object_ids = [object_ids]
-    _TO_FREE.extend(object_ids)
-
-    # batch calls to free to reduce overheads
-    now = time.time()
-    if (len(_TO_FREE) > max_free_queue_size
-            or now - _LAST_FREE_TIME > free_delay_s):
-        ray.internal.free(_TO_FREE)
-        _TO_FREE = []
-        _LAST_FREE_TIME = now
-
-    return result
-
-def get_vars(scope):
-    return [x for x in tf.global_variables() if scope in x.name]
-
-def mlp(x, hidden_size, activation, out_activation=None):
-    for hidden in hidden_size[:-1]:
-        x = tf.layers.dense(x, hidden, activation=activation)
-    return tf.layers.dense(x, hidden_size[-1], activation=out_activation)
 
 def ddpg_mlp_actor_critic(obs, 
                           a, 
@@ -136,27 +90,6 @@ class Model:
         self.ws_dphs = dphs
         return tf.group(ops)
 
-@ray.remote
-class AsyncParameterServer():
-    '''
-    Asyncronous parameter server, 
-    used for parameter sharing between learner and workers
-    '''
-    def __init__(self):
-        self._param = None
-        # hashing is a notation for paramter version
-        self.hashing = int(time.time())
-    
-    def pull(self):
-        return self._param
-    
-    def push(self, new_param):
-        self._param = new_param
-        self.hashing = int(time.time())
-    
-    def get_hashing(self):
-        return self.hashing
-
 def build_model(kwargs):
     return Model(act_dim=kwargs['act_dim'], 
                  obs_dim=kwargs['obs_dim'],
@@ -190,6 +123,7 @@ class Worker():
         self.ps = ps
         self.sess = tf.Session()
         self._init_param()
+        self._data_g = self._data_generator()
     
     def _init_param(self):
         ckpt_s = tf.train.get_checkpoint_state(self.ckpt_dir)
@@ -202,6 +136,7 @@ class Worker():
         print("init worker {} checkpoint hashing".format(self.id))
     
     def _data_generator(self):
+        print("generator test message")
         global_step = 0
         ep_step, ep_score, d, obs = 0, 0, False, self.env.reset()
         while True:
@@ -226,19 +161,20 @@ class Worker():
 
             obs_, r, d, _ = self.env.step(act)
             ep_step += 1
-            ep_score += 1
+            ep_score += r
             global_step += 1
             res = dict(obs=obs, act=act, nex_obs=obs_, r=r, d=d)
 
+            # print("test message: d {} and ep_step {}, global step {}".format(d, ep_step, global_step))
             if d or ep_step >= self.t_max:
-                ep_step, ep_score, d, obs = 0, 0, False, self.env.reset()
                 print("worker {} end episodes, episode step {}, episode score {:.2f}".format(
                     self.id, ep_step, ep_score
                 ))
+                ep_step, ep_score, d, obs = 0, 0, False, self.env.reset()
             yield res
     
     def get(self):
-        return next(self._data_generator())
+        return next(self._data_g)
 
 class RolloutCollector():
     def __init__(self, ps, **kwargs):
@@ -255,11 +191,13 @@ class RolloutCollector():
                 kwargs=kwargs
             ) for i in range(self.num_workers)
         ]
+        self._data_id_g = self._data_id_generator()
         print("#############################################")
         print("Workers starting ......")
         print("#############################################")
 
     def _data_id_generator(self, num_returns=1, timeout=None):
+        # print("generator test message")
         self.worker_done = [True for _ in range(self.num_workers)]
         self.working_job_ids = []
         self.id2job_idx = dict()
@@ -271,7 +209,7 @@ class RolloutCollector():
                     self.id2job_idx[job_id] = i
                     self.worker_done[i] = False
 
-            ready_ids, self.working_ids = ray.wait(
+            ready_ids, self.working_job_ids = ray.wait(
                 self.working_job_ids, num_returns, timeout
             )
 
@@ -282,7 +220,7 @@ class RolloutCollector():
             yield ready_ids
         
     def get_one_sample(self):
-        ready_ids = next(self._data_id_generator())
+        ready_ids = next(self._data_id_g)
         return ray_get_and_free(ready_ids)[0]
 
 class BufferReader(Thread):
@@ -304,7 +242,6 @@ class Learner():
         self.buffer = OffpolicyReplayBuffer(kwargs['obs_dim'], 
                                             kwargs['act_dim'], 
                                             kwargs['buf_size'])
-        # TODO: push into parameter server
         self.ps = AsyncParameterServer.remote()
         self.rollout_collector = RolloutCollector(self.ps, **kwargs)
 
@@ -358,22 +295,29 @@ class Learner():
                 t >= self.kwargs['update_after']) and (
                 self.buffer.iter >= kwargs['batch_size']
                 ):
+                print('update start, acuqired sample number {}'.format(self.buffer.iter))
                 for _ in range(self.kwargs['update_every']):
                     batch = self.buffer.get(self.kwargs['batch_size'])
+                    phs = [self.model.obs, self.model.act, self.model.nex_obs,
+                        self.model.r, self.model.d]
+                    keys = ['obs', 'act', 'nex_obs', 'r', 'd']
+                    fd = {ph: batch[key] for ph, key in zip(phs, keys)}
                     self.sess.run([self.train_pi_op,self.train_q_op],
-                        feed_dict=batch)
+                        feed_dict=fd)
                     self.sess.run(self.target_update_op)
                 
                 ray.get(self.ps.push.remote(self.model.get_weights(self.sess)))
+                print("pushed weights to ps")
             
-            scores, steps = [], []
-            for _ in range(self.kwargs['update_every']):
-                ep_score, ep_step = self.test_once()
-                scores.append(ep_score)
-                steps.append(ep_step)
-            print("test timetep [{}/{}], \t test score {:.2f}, \t test steps {:.2f}".format(
-                t, self.kwargs['total_steps'], np.mean(scores), np.mean(steps)
-            ))
+            if t % self.kwargs['update_every'] == 0:
+                scores, steps = [], []
+                for _ in range(self.kwargs['update_every']):
+                    ep_score, ep_step = self.test_once()
+                    scores.append(ep_score)
+                    steps.append(ep_step)
+                print("test timetep [{}/{}], \t test score {:.2f}, \t test steps {:.2f}".format(
+                    t, self.kwargs['total_steps'], np.mean(scores), np.mean(steps)
+                ))
 
 
 flags = tf.flags
@@ -391,7 +335,7 @@ flags.DEFINE_integer('seed', 0, 'random seed')
 flags.DEFINE_float('gamma', 0.99, 'discount factor')
 flags.DEFINE_float("rho", 0.995, 'smooth factor')
 
-flags.DEFINE_integer('update_after', 1000, 'update after')
+flags.DEFINE_integer('update_after', 0, 'update after')
 flags.DEFINE_integer('update_every', 50, 'update every')
 
 flags.DEFINE_integer("t_max", 200, 'maximum length of 1 episode')
@@ -400,7 +344,7 @@ flags.DEFINE_float('noise_scale', 0.01, 'noise scale')
 flags.DEFINE_string('ckpt_dir', 'tmp/', 'checkpoint directory')
 flags.DEFINE_integer('load_ckpt_period', 20, 'period for worker to load checkpoint')
 flags.DEFINE_integer('num_workers', 2, 'number of workers')
-flags.DEFINE_integer('cpu_per_worker', 2, 'cpus used for every worker')
+flags.DEFINE_integer('cpu_per_worker', 1, 'cpus used for every worker')
 
 kwargs = FLAGS.flag_values_dict()
 

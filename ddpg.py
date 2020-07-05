@@ -78,7 +78,6 @@ class Agent():
         self.sess = tf.Session()
         self.sess.run(tf.global_variables_initializer())
         self.sess.run(self.target_init_op)
-        print(tf.global_variables())
     
     def act(self, obs):
         pure_a = self.sess.run(self.pi, feed_dict={self.obs_ph: obs.reshape(1,-1)})[0]
@@ -125,8 +124,8 @@ class Agent():
                         self.r_ph: batch['r'],
                         self.d_ph: batch['d']
                     }
-                    q_loss, pi_loss, _, _ = self.sess.run(
-                        [self.q_loss, self.pi_loss, self.train_q_op, self.train_pi_op], 
+                    _, _ = self.sess.run(
+                        [self.train_q_op, self.train_pi_op], 
                         fd)
                     self.sess.run(self.target_update_op)
                 

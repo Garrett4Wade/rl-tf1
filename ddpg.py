@@ -96,7 +96,6 @@ class Agent():
         return ep_score, ep_step
     
     def train(self):
-        print([x.name for x in get_vars('main/q')])
         ep_score, ep_step, d, obs = 0, 0, False, self.env.reset()
         for i in range(self.flags.total_steps):
             global_step = i + 1

@@ -19,7 +19,7 @@ def ddpg_mlp_actor_critic(obs,
         pi = act_lim * mlp(obs, list(hidden_size)+[act_dim], activation, out_activation)
     with tf.variable_scope('q'):
         q = tf.squeeze(mlp(tf.concat([obs, a], -1), list(hidden_size)+[1], activation), -1)
-    with tf.variable_scope('q', reuse=tf.AUTO_REUSE):
+    with tf.variable_scope('q', reuse=True):
         q_pi = tf.squeeze(mlp(tf.concat([obs, pi], -1), list(hidden_size)+[1], activation), -1)
     return pi, q, q_pi
 
@@ -31,24 +31,27 @@ class Model:
     def __init__(self, obs_dim, act_dim, act_lim, is_training):
         self.set_ws_ops = None
         self.ws_dphs = None
+
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.act_lim = act_lim
+
         self.obs, self.act, self.nex_obs, self.r, self.d = \
             tf.placeholder(dtype=tf.float32, shape=(None, obs_dim), name='obs'), \
             tf.placeholder(dtype=tf.float32, shape=(None, act_dim), name='act'), \
             tf.placeholder(dtype=tf.float32, shape=(None, obs_dim), name='nex_obs'), \
             tf.placeholder(dtype=tf.float32, shape=(None,), name='r'), \
             tf.placeholder(dtype=tf.float32, shape=(None,), name='d')
+        
         with tf.variable_scope('main'):
             self.pi, self.q, self.q_pi = ddpg_mlp_actor_critic(self.obs, 
                                                                self.act,
-                                                               act_dim, act_dim)
+                                                               act_dim, act_lim)
         if is_training:
             with tf.variable_scope('target'):
-                _, _, self.q_pi_tgt = ddpg_mlp_actor_critic(self.obs, 
-                                                                   self.act,
-                                                                   act_dim, act_dim)
+                _, _, self.q_pi_tgt = ddpg_mlp_actor_critic(self.nex_obs, 
+                                                            self.act,
+                                                            act_dim, act_lim)
             self.target_init_op = tf.group([tf.assign(tgt_var, var)
                                     for var, tgt_var in zip(get_vars("main"), get_vars("target"))])
 
@@ -108,6 +111,8 @@ def build_training_model(kwargs):
 
 class Worker():
     def __init__(self, worker_id, model_fn, env_fn, ps, kwargs):
+        np.random.seed(kwargs['seed'])
+        tf.set_random_seed(kwargs['seed'])
         self.id = worker_id
         self.noise_scale = kwargs['noise_scale']
         self.t_max = kwargs['t_max']
@@ -136,7 +141,6 @@ class Worker():
         print("init worker {} checkpoint hashing".format(self.id))
     
     def _data_generator(self):
-        print("generator test message")
         global_step = 0
         ep_step, ep_score, d, obs = 0, 0, False, self.env.reset()
         while True:
@@ -154,24 +158,24 @@ class Worker():
                         print("worker {} load None from parameter server!".format(self.id))
             
             # step in environment
-            assert not d and ep_step < self.t_max
             act = self.sess.run(self.model.pi, {self.model.obs: obs.reshape(1,-1)})[0]
-            act += self.noise_scale * self.model.act_lim
+            act += self.noise_scale * self.model.act_lim * np.random.randn()
             act = np.clip(act, -self.model.act_lim, self.model.act_lim)
 
             obs_, r, d, _ = self.env.step(act)
             ep_step += 1
             ep_score += r
             global_step += 1
-            res = dict(obs=obs, act=act, nex_obs=obs_, r=r, d=d)
+            yield dict(obs=obs, act=act, nex_obs=obs_, r=r, d=d)
+
+            obs = obs_
 
             # print("test message: d {} and ep_step {}, global step {}".format(d, ep_step, global_step))
             if d or ep_step >= self.t_max:
-                print("worker {} end episodes, episode step {}, episode score {:.2f}".format(
-                    self.id, ep_step, ep_score
-                ))
+                # print("worker {} end episodes, episode step {}, episode score {:.2f}".format(
+                #     self.id, ep_step, ep_score
+                # ))
                 ep_step, ep_score, d, obs = 0, 0, False, self.env.reset()
-            yield res
     
     def get(self):
         return next(self._data_g)
@@ -236,6 +240,8 @@ class BufferReader(Thread):
 
 class Learner():
     def __init__(self, model_fn, env_fn, kwargs):
+        np.random.seed(kwargs['seed'])
+        tf.set_random_seed(kwargs['seed'])
         self.test_env = env_fn(kwargs)
 
         self.kwargs = kwargs
@@ -247,7 +253,6 @@ class Learner():
 
         self.buffer_reader = BufferReader(global_buffer=self.buffer,
                                           rollout_collector=self.rollout_collector)
-        self.buffer_reader.start()
 
         self.model = model_fn(kwargs)
 
@@ -277,6 +282,7 @@ class Learner():
             self.sess.run(self.model.target_init_op)
         
         ray.get(self.ps.push.remote(self.model.get_weights(self.sess)))
+        self.buffer_reader.start()
     
     def test_once(self):
         ep_score, ep_step, obs = 0, 0, self.test_env.reset()
@@ -291,11 +297,10 @@ class Learner():
     
     def train(self):
         for t in range(1, self.kwargs['total_steps']+1):
-            if t % self.kwargs['update_every'] == 0 and (
-                t >= self.kwargs['update_after']) and (
-                self.buffer.iter >= kwargs['batch_size']
-                ):
-                print('update start, acuqired sample number {}'.format(self.buffer.iter))
+            if self.buffer.iter >= kwargs['batch_size'] and (
+                t % self.kwargs['update_every'] == 0
+            ):
+                # print('update start, acuqired sample number {}'.format(self.buffer.iter))
                 for _ in range(self.kwargs['update_every']):
                     batch = self.buffer.get(self.kwargs['batch_size'])
                     phs = [self.model.obs, self.model.act, self.model.nex_obs,
@@ -306,8 +311,8 @@ class Learner():
                         feed_dict=fd)
                     self.sess.run(self.target_update_op)
                 
-                ray.get(self.ps.push.remote(self.model.get_weights(self.sess)))
-                print("pushed weights to ps")
+                ws = self.model.get_weights(self.sess)
+                ray.get(self.ps.push.remote(ws))
             
             if t % self.kwargs['update_every'] == 0:
                 scores, steps = [], []
@@ -327,7 +332,7 @@ flags.DEFINE_string('env_name', 'Pendulum-v0', 'name of gym environment')
 flags.DEFINE_integer('total_steps', int(1e6), 'total steps')
 flags.DEFINE_integer('buf_size', int(1e6), "replay buffer size")
 
-flags.DEFINE_integer('batch_size', 128, 'batch size')
+flags.DEFINE_integer('batch_size', 512, 'batch size')
 flags.DEFINE_float('pi_lr', 1e-3, 'learning rate for policy')
 flags.DEFINE_float('q_lr', 1e-3, 'learning rate for q function')
 
